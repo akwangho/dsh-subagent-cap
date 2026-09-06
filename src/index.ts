@@ -13,7 +13,15 @@ import z from '@deepseek-ai/schemastery'
 import { TypertRemoteService, Remote } from '@deepseek-ai/dsh-typert-protocol'
 
 export const name = 'dsh-subagent-cap'
-export const inject = ['subagents', 'agents', 'systemPrompt', 'settings']
+// Only `subagents` is required (the gate reads running children from it).
+// `systemPrompt` / `settings` are optional enhancements accessed via ctx.get()
+// so a profile missing them still boots; `agents` was unused and is dropped.
+// NOTE: this array MUST ALSO be visible as `apply.inject` (see bottom of file):
+// the cordis loader unwraps the default export (the bare `apply` function) and
+// reads `plugin.inject` off it — a named-only `export const inject` is discarded
+// and the fiber starts with an empty inject map, crashing on `ctx.subagents`
+// with `cannot get property "subagents" without inject`.
+export const inject = ['subagents']
 
 const VERSION = '1.2.0'
 const NAMESPACE = 'subagent-cap'
@@ -60,8 +68,11 @@ class SubagentCapService extends TypertRemoteService {
 
 function createController(ctx: any) {
   const subagents = ctx.subagents
-  const systemPrompt = ctx.systemPrompt
-  const settings = ctx.settings
+  // Optional services: must NOT be in `inject` (which is all-required) and must
+  // NOT be read via direct property access (that throws "without inject" when
+  // undeclared). ctx.get() returns undefined when absent instead of throwing.
+  const systemPrompt = ctx.get('systemPrompt')
+  const settings = ctx.get('settings')
 
   let config: Config = { maxSubagents: DEFAULT_MAX, mode: 'reject' }
 
@@ -95,17 +106,19 @@ function createController(ctx: any) {
   const setMax = (maxSubagents: number) => updateSetting({ maxSubagents })
   const setMode = (mode: 'reject' | 'queue') => updateSetting({ mode: mode === 'queue' ? 'queue' : 'reject' })
 
-  systemPrompt.context({
-    name: 'subagent-cap',
-    order: 950,
-    text: () => {
-      const modeHint = config.mode === 'queue'
-        ? '已達上限時，新的委派會被排隊等待，等有空位自動執行，不用重試。'
-        : '已達上限時，新的委派會被拒絕，請等現有 subagent 完成後再嘗試。'
-      return '你在這個會話中最多只能「同時」執行 ' + config.maxSubagents + ' 個 subagent。' +
-        '啟動新的 subagent 前，請先確認目前仍在執行中的 subagent 數量；' + modeHint
-    },
-  })
+  if (systemPrompt && typeof systemPrompt.context === 'function') {
+    systemPrompt.context({
+      name: 'subagent-cap',
+      order: 950,
+      text: () => {
+        const modeHint = config.mode === 'queue'
+          ? '已達上限時，新的委派會被排隊等待，等有空位自動執行，不用重試。'
+          : '已達上限時，新的委派會被拒絕，請等現有 subagent 完成後再嘗試。'
+        return '你在這個會話中最多只能「同時」執行 ' + config.maxSubagents + ' 個 subagent。' +
+          '啟動新的 subagent 前，請先確認目前仍在執行中的 subagent 數量；' + modeHint
+      },
+    })
+  }
 
   // ---- strict slot allocator + FIFO queue ----
   const counters = new Map<string, { inFlight: number; waiters: any[]; delivering: Promise<void> | null }>()
@@ -329,5 +342,25 @@ export function apply(ctx: any) {
   new SubagentCapService(ctx, controller)
   return controller.dispose
 }
+
+// The cordis plugin loader normalizes modules via unwrapExports():
+//   exports = exports.default ?? exports
+// i.e. when a default export exists it is used AS the plugin and
+// `plugin.inject` is read off it. A named-only `export const inject` is then
+// invisible and the fiber boots with no injects, so the first `ctx.subagents`
+// read throws `cannot get property "subagents" without inject` and takes down
+// the whole profile boot (dsh: plugin tree failed to load). Attaching the same
+// array to the function keeps BOTH shapes working:
+//   - namespace path (no-default consumers):  module.inject
+//   - default path (loader):                  module.default.inject
+// The sibling plugin dsh-plugin-fallback-continue avoids this by having NO
+// default export; we keep ours for back-compat but mirror inject onto it.
+;(apply as any).inject = inject
+try {
+  // Give the default path a proper plugin identity too: without this the
+  // loader sees function name "apply" and records runtime.name as undefined.
+  // Function `name` is configurable, so redefining it is safe.
+  Object.defineProperty(apply, 'name', { value: name, configurable: true })
+} catch { /* noop — cosmetic only */ }
 
 export default apply
