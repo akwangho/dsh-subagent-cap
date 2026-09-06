@@ -1,17 +1,21 @@
 /**
- * dsh-subagent-cap — host half (TypeScript source of record).
+ * dsh-subagent-cap — host half (TypeScript source of record; `lib/index.js` is
+ * the compiled artifact the runtime loads).
  *
- * Compiled to `lib/index.js`. Enforces a per-session cap on concurrently
- * running subagents with imperative guidance, a real pre-emptive block at
- * `tools/pre-execute`, a queue mode, and `settings`-backed persistence.
+ * Strict per-session subagent concurrency cap with a real FIFO queue:
+ *  - imperative model guidance via systemPrompt.context(),
+ *  - pre-emptive gate at `tools/pre-execute` with in-flight slot accounting
+ *    (parallel spawns cannot race past the cap),
+ *  - queue mode holds the waterfall decision until a slot frees,
+ *  - settings-backed persistence (~/.dsh/settings.yaml, namespace subagent-cap).
  */
 import z from '@deepseek-ai/schemastery'
 import { TypertRemoteService, Remote } from '@deepseek-ai/dsh-typert-protocol'
 
 export const name = 'dsh-subagent-cap'
-export const inject = ['subagents', 'agents', 'systemPrompt', 'timer']
+export const inject = ['subagents', 'agents', 'systemPrompt', 'settings']
 
-const VERSION = '1.0.0'
+const VERSION = '1.1.0'
 const NAMESPACE = 'subagent-cap'
 const DELEGATE_TOOLS = new Set(['subagent', 'subagent_fork', 'workflow'])
 const DEFAULT_MAX = 1
@@ -57,7 +61,7 @@ class SubagentCapService extends TypertRemoteService {
 function createController(ctx: any) {
   const subagents = ctx.subagents
   const systemPrompt = ctx.systemPrompt
-  const settings = ctx.get('settings')
+  const settings = ctx.settings
 
   let config: Config = { maxSubagents: DEFAULT_MAX, mode: 'reject' }
 
@@ -73,44 +77,45 @@ function createController(ctx: any) {
   if (settings && typeof settings.installSection === 'function') {
     settings.installSection(ctx, NAMESPACE, SCHEMA, { maxSubagents: DEFAULT_MAX, mode: 'reject' }, {
       setSource: (current: () => Config) => { config = sanitize(current()) },
-      onChange: () => {},
+      onChange: () => { deliverAll() },
     })
   }
 
-  async function setMax(maxSubagents: number) {
+  async function updateSetting(patch: Partial<Config>) {
     if (settings && typeof settings.update === 'function') {
-      await settings.update(NAMESPACE, { maxSubagents })
+      await settings.update(NAMESPACE, patch)
       const resolved = settings.get(NAMESPACE)
       if (resolved !== undefined) config = sanitize(resolved)
     } else {
-      config = sanitize({ ...config, maxSubagents })
+      config = sanitize({ ...config, ...patch })
     }
+    deliverAll()
     return { ok: true, maxSubagents: config.maxSubagents, mode: config.mode }
   }
-
-  async function setMode(mode: 'reject' | 'queue') {
-    const next = mode === 'queue' ? 'queue' : 'reject'
-    if (settings && typeof settings.update === 'function') {
-      await settings.update(NAMESPACE, { mode: next })
-      const resolved = settings.get(NAMESPACE)
-      if (resolved !== undefined) config = sanitize(resolved)
-    } else {
-      config = sanitize({ ...config, mode: next })
-    }
-    return { ok: true, maxSubagents: config.maxSubagents, mode: config.mode }
-  }
+  const setMax = (maxSubagents: number) => updateSetting({ maxSubagents })
+  const setMode = (mode: 'reject' | 'queue') => updateSetting({ mode: mode === 'queue' ? 'queue' : 'reject' })
 
   systemPrompt.context({
     name: 'subagent-cap',
     order: 950,
     text: () => {
       const modeHint = config.mode === 'queue'
-        ? '已達上限時，新的委派會被排隊，等有空位再執行。'
-        : '已達上限時，新的委派會被拒絕。'
+        ? '已達上限時，新的委派會被排隊等待，等有空位自動執行，不用重試。'
+        : '已達上限時，新的委派會被拒絕，請等現有 subagent 完成後再嘗試。'
       return '你在這個會話中最多只能「同時」執行 ' + config.maxSubagents + ' 個 subagent。' +
         '啟動新的 subagent 前，請先確認目前仍在執行中的 subagent 數量；' + modeHint
     },
   })
+
+  // ---- strict slot allocator + FIFO queue ----
+  const counters = new Map<string, { inFlight: number; waiters: any[] }>()
+  const heldBy = new Map<string, string>()
+
+  function counter(parentId: string) {
+    let c = counters.get(parentId)
+    if (!c) { c = { inFlight: 0, waiters: [] }; counters.set(parentId, c) }
+    return c
+  }
 
   async function runningCount(parentId: string): Promise<number> {
     try {
@@ -121,46 +126,113 @@ function createController(ctx: any) {
     }
   }
 
-  const queueLog = new Map<string, { count: number; last: number }>()
-  const rejections: Array<{ time: number; sessionId: string; tool: string; reason: string }> = []
-
-  function noteQueue(sessionId: string) {
-    const cur = queueLog.get(sessionId) || { count: 0, last: 0 }
-    cur.count += 1
-    cur.last = Date.now()
-    queueLog.set(sessionId, cur)
-  }
-  function noteRejection(sessionId: string, tool: string, reason: string) {
-    rejections.push({ time: Date.now(), sessionId, tool, reason })
-    if (rejections.length > 100) rejections.splice(0, rejections.length - 100)
+  function acquire(parentId: string, exec: any) {
+    const c = counter(parentId)
+    c.inFlight += 1
+    const callId = exec && exec.callId
+    if (callId !== undefined && callId !== null) heldBy.set(String(callId), parentId)
   }
 
-  ctx.on('tools/pre-execute', async (exec: any, next: () => Promise<any>) => {
+  function releaseHeld(callId: unknown) {
+    const key = String(callId)
+    const parentId = heldBy.get(key)
+    if (parentId === undefined) return
+    heldBy.delete(key)
+    const c = counter(parentId)
+    if (c.inFlight > 0) c.inFlight -= 1
+    deliver(parentId)
+  }
+
+  async function deliver(parentId: string) {
+    const c = counter(parentId)
+    while (c.waiters.length > 0) {
+      const running = await runningCount(parentId)
+      if (running + c.inFlight >= Math.max(config.maxSubagents, 0)) return
+      if (config.mode !== 'queue') {
+        const held = c.waiters.splice(0)
+        for (const w of held) {
+          try { w.resolve({ kind: 'deny', reason: 'subagent-cap switched to reject mode' }) } catch { /* noop */ }
+        }
+        return
+      }
+      const w = c.waiters.shift()
+      if (!w) return
+      try {
+        c.inFlight += 1
+        const callId = w.exec && w.exec.callId
+        if (callId !== undefined && callId !== null) heldBy.set(String(callId), parentId)
+        w.resolve(w.next())
+      } catch {
+        if (c.inFlight > 0) c.inFlight -= 1
+      }
+    }
+    if (c.waiters.length === 0 && c.inFlight === 0) counters.delete(parentId)
+  }
+
+  function deliverAll() {
+    for (const parentId of Array.from(counters.keys())) deliver(parentId).catch(() => {})
+  }
+
+  const offPre = ctx.on('tools/pre-execute', async (exec: any, next: () => Promise<any>) => {
     const toolName = exec && exec.name
     if (!toolName || !DELEGATE_TOOLS.has(toolName)) return next()
     const parentId = exec.agent && exec.agent.id ? String(exec.agent.id) : undefined
     if (!parentId) return next()
 
     const running = await runningCount(parentId)
-    if (running < config.maxSubagents) return next()
+    if (running + counter(parentId).inFlight < Math.max(config.maxSubagents, 0)) {
+      acquire(parentId, exec)
+      return next()
+    }
 
-    if (config.mode === 'queue') {
-      noteQueue(parentId)
+    if (config.mode !== 'queue') {
+      noteRejection(parentId, toolName, 'over-limit')
       return {
         kind: 'deny',
         reason: 'Subagent cap reached (' + running + '/' + config.maxSubagents +
-          ' running). Your request was queued — wait for a running subagent to finish, then retry.',
+          ' running). A new subagent cannot be started now.',
       }
     }
-    noteRejection(parentId, toolName, 'over-limit')
-    return {
-      kind: 'deny',
-      reason: 'Subagent cap reached (' + running + '/' + config.maxSubagents +
-        ' running). A new subagent cannot be started now.',
-    }
+
+    noteQueue(parentId, toolName)
+    return await new Promise((resolve) => {
+      const c = counter(parentId)
+      const signal = exec && exec.signal
+      const waiter = { exec, next, resolve }
+      const onAbort = () => {
+        const i = c.waiters.indexOf(waiter)
+        if (i >= 0) c.waiters.splice(i, 1)
+        resolve({ kind: 'deny', reason: 'Subagent queue wait cancelled.' })
+      }
+      if (signal && typeof signal.addEventListener === 'function') {
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+      c.waiters.push(waiter)
+    })
   })
 
-  const offStart = ctx.on('subagent/start', () => {})
+  const offResult = ctx.on('tools/result', (exec: any) => {
+    const toolName = exec && exec.name
+    if (!toolName || !DELEGATE_TOOLS.has(toolName)) return
+    const callId = exec && exec.callId
+    if (callId !== undefined && callId !== null) releaseHeld(callId)
+  })
+
+  const offEnd = ctx.on('subagent/end', () => { deliverAll() })
+
+  const queueLog = new Map<string, { count: number; last: number; tool: string }>()
+  const rejections: Array<{ time: number; sessionId: string; tool: string; reason: string }> = []
+  function noteQueue(sessionId: string, tool: string) {
+    const cur = queueLog.get(sessionId) || { count: 0, last: 0, tool }
+    cur.count += 1
+    cur.last = Date.now()
+    cur.tool = tool
+    queueLog.set(sessionId, cur)
+  }
+  function noteRejection(sessionId: string, tool: string, reason: string) {
+    rejections.push({ time: Date.now(), sessionId, tool, reason })
+    if (rejections.length > 100) rejections.splice(0, rejections.length - 100)
+  }
 
   function getState() {
     return {
@@ -170,8 +242,16 @@ function createController(ctx: any) {
       queue: Array.from(queueLog.entries()).map(([sessionId, v]) => ({
         sessionId: sessionId.slice(0, 12) + '…',
         count: v.count,
+        tool: v.tool,
         last: v.last,
       })),
+      waiters: Array.from(counters.entries())
+        .filter(([, c]) => c.waiters.length > 0 || c.inFlight > 0)
+        .map(([parentId, c]) => ({
+          sessionId: parentId.slice(0, 12) + '…',
+          inFlight: c.inFlight,
+          waiting: c.waiters.length,
+        })),
       rejections: rejections.slice(-20).map((r) => ({
         time: r.time,
         sessionId: r.sessionId.slice(0, 12) + '…',
@@ -181,7 +261,24 @@ function createController(ctx: any) {
     }
   }
 
-  return { getState, setMax, setMode, dispose: () => { offStart() } }
+  let disposed = false
+  function dispose() {
+    if (disposed) return
+    disposed = true
+    offPre()
+    offResult()
+    offEnd()
+    for (const [, c] of counters) {
+      for (const w of c.waiters) {
+        try { w.resolve({ kind: 'deny', reason: 'subagent-cap plugin stopped' }) } catch { /* noop */ }
+      }
+      c.waiters.length = 0
+    }
+    counters.clear()
+    heldBy.clear()
+  }
+
+  return { getState, setMax, setMode, dispose }
 }
 
 export function apply(ctx: any) {
