@@ -23,7 +23,7 @@ export const name = 'dsh-subagent-cap'
 // with `cannot get property "subagents" without inject`.
 export const inject = ['subagents']
 
-const VERSION = '1.2.0'
+const VERSION = '1.2.1'
 const NAMESPACE = 'subagent-cap'
 const DELEGATE_TOOLS = new Set(['subagent', 'subagent_fork', 'workflow'])
 const DEFAULT_MAX = 1
@@ -72,9 +72,12 @@ function createController(ctx: any) {
   // NOT be read via direct property access (that throws "without inject" when
   // undeclared). ctx.get() returns undefined when absent instead of throwing.
   const systemPrompt = ctx.get('systemPrompt')
-  const settings = ctx.get('settings')
 
   let config: Config = { maxSubagents: DEFAULT_MAX, mode: 'reject' }
+  // The settings source is a GETTER: installSection hands us
+  // `setSource(() => scope.get())`. It must be stored and re-read on every
+  // change — caching the value would freeze enforcement at install time.
+  let source: () => Config = () => ({ maxSubagents: DEFAULT_MAX, mode: 'reject' })
 
   function sanitize(value: any): Config {
     const max = Number(value && value.maxSubagents)
@@ -85,18 +88,30 @@ function createController(ctx: any) {
     }
   }
 
-  if (settings && typeof settings.installSection === 'function') {
-    settings.installSection(ctx, NAMESPACE, SCHEMA, { maxSubagents: DEFAULT_MAX, mode: 'reject' }, {
-      setSource: (current: () => Config) => { config = sanitize(current()) },
-      onChange: () => { deliverAll() },
+  function refresh(): void {
+    config = sanitize(source())
+  }
+
+  // Persist through the DSH settings service; edits from any surface (the
+  // settings UI, a manual settings.yaml edit, another plugin) propagate via
+  // onChange -> refresh. Nested ctx.inject so a late-mounted or hot-reloaded
+  // `settings` service re-installs the section rather than silently leaving
+  // the plugin on in-memory defaults (canonical dsh-agent-* pattern).
+  // The settings section installs at the END of createController (see below):
+  // installSection fires onChange synchronously, which reaches the allocator
+  // (deliverAll -> counters) — those consts must already be initialized.
+  const installSettings = (settingsCtx: any) => {
+    settingsCtx.settings.installSection(ctx, NAMESPACE, SCHEMA, { maxSubagents: DEFAULT_MAX, mode: 'reject' }, {
+      setSource: (next: () => Config) => { source = next; refresh() },
+      onChange: () => { refresh(); deliverAll() },
     })
   }
 
   async function updateSetting(patch: Partial<Config>) {
+    const settings = ctx.get('settings')
     if (settings && typeof settings.update === 'function') {
       await settings.update(NAMESPACE, patch)
-      const resolved = settings.get(NAMESPACE)
-      if (resolved !== undefined) config = sanitize(resolved)
+      refresh()
     } else {
       config = sanitize({ ...config, ...patch })
     }
@@ -332,6 +347,17 @@ function createController(ctx: any) {
     }
     counters.clear()
     heldBy.clear()
+  }
+
+  // Install settings last: installSection fires onChange synchronously, which
+  // touches deliverAll() -> counters; those must be initialized first.
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['settings'], installSettings)
+  } else {
+    const settingsNow = ctx.get('settings')
+    if (settingsNow && typeof settingsNow.installSection === 'function') {
+      installSettings({ settings: settingsNow })
+    }
   }
 
   return { getState, setMax, setMode, dispose }
