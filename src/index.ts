@@ -15,7 +15,7 @@ import { TypertRemoteService, Remote } from '@deepseek-ai/dsh-typert-protocol'
 export const name = 'dsh-subagent-cap'
 export const inject = ['subagents', 'agents', 'systemPrompt', 'settings']
 
-const VERSION = '1.1.0'
+const VERSION = '1.2.0'
 const NAMESPACE = 'subagent-cap'
 const DELEGATE_TOOLS = new Set(['subagent', 'subagent_fork', 'workflow'])
 const DEFAULT_MAX = 1
@@ -108,12 +108,12 @@ function createController(ctx: any) {
   })
 
   // ---- strict slot allocator + FIFO queue ----
-  const counters = new Map<string, { inFlight: number; waiters: any[] }>()
+  const counters = new Map<string, { inFlight: number; waiters: any[]; delivering: Promise<void> | null }>()
   const heldBy = new Map<string, string>()
 
   function counter(parentId: string) {
     let c = counters.get(parentId)
-    if (!c) { c = { inFlight: 0, waiters: [] }; counters.set(parentId, c) }
+    if (!c) { c = { inFlight: 0, waiters: [], delivering: null }; counters.set(parentId, c) }
     return c
   }
 
@@ -126,14 +126,10 @@ function createController(ctx: any) {
     }
   }
 
-  function acquire(parentId: string, exec: any) {
-    const c = counter(parentId)
-    c.inFlight += 1
-    const callId = exec && exec.callId
-    if (callId !== undefined && callId !== null) heldBy.set(String(callId), parentId)
-  }
-
+  // Release an admitted slot exactly once. Idempotent — safe to call from the
+  // three possible settle paths (tool result, caller abort, waterfall reject).
   function releaseHeld(callId: unknown) {
+    if (callId === undefined || callId === null) return
     const key = String(callId)
     const parentId = heldBy.get(key)
     if (parentId === undefined) return
@@ -143,7 +139,27 @@ function createController(ctx: any) {
     deliver(parentId)
   }
 
-  async function deliver(parentId: string) {
+  function acquire(parentId: string, exec: any) {
+    const c = counter(parentId)
+    c.inFlight += 1
+    const callId = exec && exec.callId
+    if (callId !== undefined && callId !== null) {
+      heldBy.set(String(callId), parentId)
+      // If the caller aborts before dispatch completes, tools/result may never
+      // fire — without this hook the slot would leak permanently.
+      const signal = exec.signal
+      if (signal && typeof signal.addEventListener === 'function') {
+        signal.addEventListener('abort', () => releaseHeld(callId), { once: true })
+      }
+    }
+  }
+
+  function maybeGC(parentId: string) {
+    const c = counters.get(parentId)
+    if (c && c.waiters.length === 0 && c.inFlight === 0) counters.delete(parentId)
+  }
+
+  async function deliverStep(parentId: string) {
     const c = counter(parentId)
     while (c.waiters.length > 0) {
       const running = await runningCount(parentId)
@@ -153,24 +169,37 @@ function createController(ctx: any) {
         for (const w of held) {
           try { w.resolve({ kind: 'deny', reason: 'subagent-cap switched to reject mode' }) } catch { /* noop */ }
         }
+        maybeGC(parentId)
         return
       }
       const w = c.waiters.shift()
       if (!w) return
+      const callId = w.exec && w.exec.callId
+      acquire(parentId, w.exec)
       try {
-        c.inFlight += 1
-        const callId = w.exec && w.exec.callId
-        if (callId !== undefined && callId !== null) heldBy.set(String(callId), parentId)
-        w.resolve(w.next())
+        const decision = w.next()
+        // A later rejection is NOT caught by the try/catch — release on it.
+        Promise.resolve(decision).catch(() => releaseHeld(callId))
+        w.resolve(decision)
       } catch {
-        if (c.inFlight > 0) c.inFlight -= 1
+        releaseHeld(callId)
+        try { w.resolve({ kind: 'deny', reason: 'Subagent queue admission failed.' }) } catch { /* noop */ }
       }
     }
-    if (c.waiters.length === 0 && c.inFlight === 0) counters.delete(parentId)
+    maybeGC(parentId)
+  }
+
+  // Serialized per-parent so concurrent triggers never over-admit.
+  function deliver(parentId: string) {
+    const c = counter(parentId)
+    c.delivering = (c.delivering || Promise.resolve())
+      .then(() => deliverStep(parentId))
+      .catch(() => {})
+    return c.delivering
   }
 
   function deliverAll() {
-    for (const parentId of Array.from(counters.keys())) deliver(parentId).catch(() => {})
+    for (const parentId of Array.from(counters.keys())) deliver(parentId)
   }
 
   const offPre = ctx.on('tools/pre-execute', async (exec: any, next: () => Promise<any>) => {
@@ -182,7 +211,14 @@ function createController(ctx: any) {
     const running = await runningCount(parentId)
     if (running + counter(parentId).inFlight < Math.max(config.maxSubagents, 0)) {
       acquire(parentId, exec)
-      return next()
+      try {
+        const decision = next()
+        Promise.resolve(decision).catch(() => releaseHeld(exec.callId))
+        return decision
+      } catch (err) {
+        releaseHeld(exec.callId)
+        throw err
+      }
     }
 
     if (config.mode !== 'queue') {
@@ -198,12 +234,19 @@ function createController(ctx: any) {
     return await new Promise((resolve) => {
       const c = counter(parentId)
       const signal = exec && exec.signal
-      const waiter = { exec, next, resolve }
+      const waiter = { exec, next, resolve, admitted: false }
       const onAbort = () => {
         const i = c.waiters.indexOf(waiter)
-        if (i >= 0) c.waiters.splice(i, 1)
-        resolve({ kind: 'deny', reason: 'Subagent queue wait cancelled.' })
+        if (i >= 0) {
+          c.waiters.splice(i, 1)
+          maybeGC(parentId)
+          resolve({ kind: 'deny', reason: 'Subagent queue wait cancelled.' })
+        }
+        // If already admitted, acquire()'s abort hook releases the slot;
+        // the promise was already settled by deliver().
       }
+      const origResolve = resolve
+      waiter.resolve = ((decision: any) => { waiter.admitted = true; origResolve(decision) }) as typeof resolve
       if (signal && typeof signal.addEventListener === 'function') {
         signal.addEventListener('abort', onAbort, { once: true })
       }
