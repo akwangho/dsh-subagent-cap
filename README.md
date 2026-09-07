@@ -26,8 +26,7 @@
 
 ```
 dsh-subagent-cap/
-├── package.json        # name/exports/dsh.bundle.patch/dsh.client + peerDeps
-├── cordis.patch.yml    # loader insert entry (id + name)
+├── package.json        # name/exports/dsh.client + peerDeps
 ├── tsconfig.json       # TypeScript 建置設定（src -> lib）
 ├── LICENSE
 ├── README.md
@@ -41,13 +40,21 @@ dsh-subagent-cap/
 
 ## 安裝
 
-1. 把這個 package 放進 profile 的 `node_modules`：
+1. 把編譯好的 `lib/`、`package.json`、`README.md`、`LICENSE` 複製進 profile 的 `node_modules`：
    ```sh
-   ln -s /path/to/dsh-subagent-cap ~/.dsh/profiles/web/node_modules/dsh-subagent-cap
+   PKG=~/.dsh/profiles/web/node_modules/dsh-subagent-cap
+   mkdir -p "$PKG/lib"
+   cp lib/index.js lib/client.js "$PKG/lib/"
+   cp package.json README.md LICENSE "$PKG/"
    ```
-2. 在 `~/.dsh/profiles/web/package.json` 的 `dsh.profile.bundles` 加入 `"dsh-subagent-cap"`。
-3. `cordis.patch.yml`（package 內建）會被 bundle 層套用，注入 loader entry。
-4. 重啟 `dsh web`。
+   > 不要用 `ln -s` 把整個 repo 連進 `node_modules`：Node ESM 會從 symlink 的真實路徑去解析 bare import（如 `@deepseek-ai/dsh-typert-protocol`），而 repo 內沒有 `node_modules`，`dsh web` 啟動時會 `plugin tree failed to load`。複製進 `node_modules` 的檔案則會沿 `~/.dsh/profiles/node_modules` 解析到與 Host 相同的模組實例。
+2. 在 `~/.dsh/profiles/web/cordis.patch.yml` 註冊 loader entry：
+   ```yaml
+   - insert:
+       - id: subagent-cap
+         name: 'dsh-subagent-cap'
+   ```
+3. 重啟 `dsh web`。（設定頁會出現「Subagent 上限」卡片；預設每會話 1 個、拒絕模式。）
 
 ## Host⇄Client 通訊
 
