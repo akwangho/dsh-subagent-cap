@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Subagent 上限",
+    "description": "限制單一會話中同時執行的 subagent 數量（預設 1）。真正的 in-flight 感知名額配額器可避免兩個平行啟動同時衝過上限；達上限時，新的委派會被拒絕，或進入真正的 FIFO 排隊直到有空位。設定是一般的 volatile plugin Config，由 DSH 寫回 profile patch。"
+  }
+}

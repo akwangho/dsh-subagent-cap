@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Subagent cap",
+    "description": "Limits how many subagents may run concurrently in a single session (default 1). A real in-flight-aware slot allocator stops two parallel spawns from racing past the cap, and over the cap the new delegate is either rejected or held in a true FIFO queue until a slot frees. Settings are ordinary volatile plugin Config, persisted by DSH into the profile patch."
+  }
+}

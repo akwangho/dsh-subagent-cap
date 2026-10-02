@@ -13,26 +13,23 @@ import { test } from 'node:test'
 
 import * as plugin from '../lib/index.js'
 
-// A controllable fake ctx: settable running children, settings store, and
+// A controllable fake ctx: settable running children, live Config references, and
 // captured event listeners. `reflect.provide` satisfies the Cordis Service
 // constructor used by TypertRemoteService.
 function makeHarness({ maxSubagents = 1, mode = 'queue', withSettings = true } = {}) {
   const listeners = {}
   let running = []
   let stored = { maxSubagents, mode }
-  let hooks = null
 
-  const settings = withSettings ? {
-    installSection(_ctx, _ns, _schema, _defaults, h) {
-      hooks = h
-      h.setSource(() => stored)
-      h.onChange()
-    },
-    async update(_ns, patch) {
-      Object.assign(stored, patch)
-      if (hooks) hooks.onChange()
-    },
-  } : undefined
+  // Config arrives as cordis references, exactly as the Loader passes it. A
+  // settings-page edit commits into the reference and dispatches
+  // `loader/volatile-update`; that is what `commit()` below replays.
+  const refs = {
+    maxSubagents: { get: () => stored.maxSubagents },
+    mode: { get: () => stored.mode },
+  }
+
+  const settings = withSettings ? { configure: () => () => {} } : undefined
 
   let injected = null
   const ctx = {
@@ -43,10 +40,12 @@ function makeHarness({ maxSubagents = 1, mode = 'queue', withSettings = true } =
     get: (k) => (k === 'systemPrompt' ? { context() {} } : k === 'settings' ? settings : undefined),
     inject: (deps, cb) => { injected = { deps, cb } }, // deferred; call injectNow() to run it
     on: (ev, fn) => { listeners[ev] = fn; return () => { delete listeners[ev] } },
-    effect: () => {},
+    emit: (ev, ...args) => { if (listeners[ev]) listeners[ev](...args) },
+    effect: (cb) => { const d = cb(); return typeof d === 'function' ? d : () => {} },
+    fiber: { name: 'dsh-subagent-cap' },
   }
 
-  const dispose = plugin.apply(ctx)
+  const dispose = plugin.apply(ctx, refs)
 
   return {
     dispose,
@@ -56,7 +55,11 @@ function makeHarness({ maxSubagents = 1, mode = 'queue', withSettings = true } =
     get running() { return running },
     set running(v) { running = v },
     get stored() { return stored },
-    set stored(v) { stored = v; if (hooks) hooks.onChange() },
+    /** Commit config the way the Loader does: mutate the reference, then notify. */
+    commit(patch) {
+      stored = { ...stored, ...patch }
+      ctx.emit('loader/volatile-update', [Object.keys(patch)])
+    },
     // a standard delegate call + a next() that succeeds
     delegate(callId, extra = {}) {
       return { name: 'subagent', agent: { id: 'sess-000000000000' }, callId, ...extra }
@@ -105,13 +108,24 @@ test('over-cap in queue mode HOLDS the decision instead of denying', async () =>
 test('FIFO: subagent/end frees the slot and admits the queued waiter', async () => {
   const h = makeHarness({ maxSubagents: 1, mode: 'queue' })
   const pre = h.listeners['tools/pre-execute']
+  const onResult = h.listeners['tools/result']
+
+  // Model the real delegate lifecycle. Admitting a call only takes an inFlight
+  // slot; the child becomes RUNNING when the spawn call settles (tools/result).
+  // `subagent/end` frees a running slot — not an inFlight one — so the test has
+  // to walk both steps. (Conflating the two is what made an earlier version of
+  // this test unpassable: an admitted-but-not-yet-spawned delegate keeps its
+  // inFlight slot, so occupancy never drops.)
   await pre(h.delegate('c1'), allow)
+  h.running = [{ kind: 'child', activity: 'running' }]   // c1's spawn landed
+  onResult({ name: 'subagent', callId: 'c1' })            // -> inFlight 1 -> 0
+
   let c2 = null
   pre(h.delegate('c2'), allow).then((v) => { c2 = v })
   await settle()
-  assert.equal(c2, null)
+  assert.equal(c2, null, 'cap is full (one child running), so c2 waits')
 
-  // child ends -> deliverAll -> c2 admitted
+  // child ends -> deliverAll -> occupancy 0 -> c2 admitted
   h.running = []
   h.listeners['subagent/end']()
   await settle(60)
@@ -128,7 +142,7 @@ test('queue→reject mode flip DENIES held waiters instead of hanging them', asy
   await settle()
   assert.equal(c2, null)
 
-  await h.settings.update('subagent-cap', { mode: 'reject' }) // -> onChange -> deliverAll
+  h.commit({ mode: 'reject' }) // -> loader/volatile-update -> deliverAll
   await settle(60)
   assert.equal(c2 && c2.kind, 'deny', 'waiter must be denied after mode flip, not hang')
   h.dispose()
