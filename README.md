@@ -117,6 +117,20 @@ dsh-subagent-cap/
                                               釋出名額後依序放行
 ```
 
+## 註冊在兩個 settings slot
+
+設定頁**同時**註冊在兩個 slot：
+
+1. **`settings.plugins.tab`** — 這個是關鍵。Plugins 設定區段是用
+   `renderSlot("settings.plugins.tab", {}, { only: single.id })` 來畫「你選的那個外掛」的頁面，
+   也就是它**用外掛的 profile entry id 去查**。只註冊 `settings.section` 的話，
+   在「設定 → 外掛」點進這個外掛會**什麼都沒有**。
+   而且因為我們宣告了 `settings.configure({ auto: false })`，DSH 明確**不會**自動產生一個頁面來補這個洞。
+2. **`settings.section`** — 主要的設定導覽列，讓你不經過 Plugins 也能調整上限。
+
+兩者用**同一個** component（同一份輪詢、同一份草稿）。
+`test/client-slots.test.mjs` 直接鎖住這個註冊形狀，因為這個錯誤在行為上完全看不出來——頁面確實註冊了，只是註冊在沒人看的 surface 上。
+
 ## ⚠️ 絕對不要有 default export
 
 這個模組**只能**用具名 export（`apply` / `inject` / `name` / `Config`）。Loader 的正規化是：
