@@ -117,6 +117,18 @@ dsh-subagent-cap/
                                               釋出名額後依序放行
 ```
 
+## ⚠️ 絕對不要有 default export
+
+這個模組**只能**用具名 export（`apply` / `inject` / `name` / `Config`）。Loader 的正規化是：
+
+```js
+exports = exports.default ?? exports
+```
+
+一旦有 `export default apply`，整個 runtime 就會被換成那個裸函式，namespace 上的 `Config` / `inject` / `name` 全部**看不見**。症狀非常安靜：DSH 把這個 entry 的 config 解析成 `unknownConfig`，volatile 表單不會產生，設定頁什麼都存不進去——但外掛看起來一切正常。
+
+（1.3.0 就踩過這個坑，是靠 `dsh --dump-config-schema` 顯示 `unknownConfig` 才抓到的，不是靠單元測試。`test/rpc.test.mjs` 現在直接守住「沒有 default export」這個形狀。）
+
 ## ⚠️ `src/` 已經過期
 
 `src/index.ts` / `src/client.ts` 停留在 2026-09-06 的狀態，**沒有**跟上 1.3.0 的變更（仍含已移除的 `settings.installSection`，也沒有 volatile Config）。

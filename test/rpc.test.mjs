@@ -189,8 +189,26 @@ test('the removed write RPCs are gone; getState is the only Remote method', () =
   assert.equal(h.svc.setMode, undefined, 'setMode must no longer be exposed')
 })
 
-test('loader inject mirror: apply.inject exposes the required services', () => {
+test('the module exports the plugin identity the Loader reads', () => {
   assert.deepEqual(plugin.inject, ['subagents'])
-  assert.deepEqual(plugin.apply.inject, ['subagents'], 'apply must mirror inject for the default-export loader')
   assert.equal(plugin.name, 'dsh-subagent-cap')
+  assert.equal(typeof plugin.apply, 'function')
+  // A schemastery Schema is a callable object, so check for the schema surface
+  // rather than a bare `typeof` (the volatile/default contract itself is pinned
+  // in test/manifest.test.mjs).
+  assert.ok(plugin.Config, 'Config must be a named export so the Loader can see it')
+  assert.equal(typeof plugin.Config.toJSON, 'function')
+})
+
+test('the module has NO default export, or the Loader discards Config', async () => {
+  // The Loader normalizes a module with `exports = exports.default ?? exports`.
+  // A default export REPLACES the module namespace, so `Config` / `inject` /
+  // `name` become invisible and DSH silently falls back to `unknownConfig` —
+  // no volatile form, so the settings section cannot save. This asserts the
+  // shape rather than the symptom, because the symptom is invisible in tests.
+  const mod = await import('../lib/index.js')
+  assert.equal(
+    mod.default, undefined,
+    'a default export hides Config/inject/name from the Loader; remove it',
+  )
 })
