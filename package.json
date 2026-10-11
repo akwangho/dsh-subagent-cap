@@ -1,6 +1,6 @@
 {
   "name": "dsh-subagent-cap",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "DSH (DeepSeek Harness) plugin: limits the number of concurrently running subagents per session (default 1), with reject-or-queue enforcement, a real in-flight-aware slot allocator, and a settings UI. Settings are ordinary volatile plugin Config, edited from the plugin's own settings section and persisted by DSH into the profile patch.",
   "keywords": [
     "dsh",

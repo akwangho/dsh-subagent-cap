@@ -88,7 +88,6 @@ function mountClient({ configForm } = {}) {
     connection: {
       rpc: { call: async () => ({ ok: true, value: { version: 'test', maxSubagents: 1, mode: 'reject', rejections: [] } }) },
     },
-    remote: {},
     configForms: {
       get: () => configForm === null ? undefined : (configForm || {
         getSnapshot: () => ({ status: 'ready', value: { maxSubagents: 1, mode: 'reject' }, writable: true, mode: 'host', revision: 0 }),
